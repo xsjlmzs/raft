@@ -123,6 +123,8 @@ type Raft struct {
 	applySignal chan ApplyMsg
 
 	Quorum int
+
+	permitLock chan int
 }
 
 // return currentTerm and whether this server
@@ -175,6 +177,7 @@ func (rf *Raft) persist() {
 //
 // restore previously persisted state.
 //
+
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
@@ -279,9 +282,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				Term        int
 				CandidateId int
 			}{args.Term, args.CandidateId} // to follower
-			for rf.Role != FOLLOWER {
-				log.Printf("server id: %v waiting~\n", rf.me)
-			}
+			<-rf.permitLock
 		}
 	}
 	reply.Term = args.Term
@@ -297,6 +298,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				Term        int
 				CandidateId int
 			}{args.Term, args.CandidateId}
+			<-rf.permitLock
 			reply.VoteGRanted = true
 		} else {
 			reply.VoteGRanted = false
@@ -353,6 +355,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		// rf.CurrentTerm <= args.Term
 		rf.heartbeatSignal <- args.Term
+		<-rf.permitLock
 	}
 	reply.Term = args.Term
 	log.Printf("--term: %v %v id: %v 收到有效AppendEntries RPC, 内容为: %v--\n", rf.CurrentTerm, rolemap[rf.Role], rf.me, args.Entries)
@@ -396,11 +399,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			logIndex++
 		}
-		rf.persist()
-
 		if len(args.Entries) != 0 {
+			rf.persist()
 			log.Printf("--日志 %v: id: %v,内容为: %v --\n", rolemap[rf.Role], rf.me, rf.Log.entries)
 		}
+
 		// 更新commitIndex
 		if args.LeaderCommitIndex > rf.commitIndex {
 			rf.updateCommitIndex(args.LeaderCommitIndex, logIndex-1)
@@ -474,6 +477,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if reply.Term > rf.CurrentTerm {
 		log.Printf("--term: %v %v id: %v 收到AppendEntries响应with greater term,成为follower--\n", rf.CurrentTerm, rolemap[rf.Role], rf.me)
 		rf.heartbeatSignal <- reply.Term
+		<-rf.permitLock
 	} else if reply.Term < rf.CurrentTerm {
 		// log.Printf("--term: %v %v id: %v 收到过期AppendEntries响应,忽略--\n", rf.CurrentTerm, rolemap[rf.Role], rf.me)
 	} else if rf.Role == LEADER {
@@ -567,7 +571,7 @@ func (rf *Raft) Start(command interface{}) (index, term int, isLeader bool) {
 
 	rf.matchIndex[rf.me] = index
 
-	rf.sendHeartbeat()
+	// rf.sendHeartbeat()
 	return
 }
 
@@ -638,8 +642,8 @@ func (rf *Raft) toFollower(term int) {
 	// candidate to follower
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
-	rf.CurrentTerm = term
 	rf.Role = FOLLOWER
+	rf.CurrentTerm = term
 	rf.VatedFor = -1
 	rf.persist()
 }
@@ -647,8 +651,8 @@ func (rf *Raft) toCandidate(term int) {
 	// follower to candidate
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
-	rf.CurrentTerm = term
 	rf.Role = CANDIDATE
+	rf.CurrentTerm = term
 	rf.VatedFor = rf.me
 	rf.persist()
 }
@@ -683,14 +687,17 @@ func (rf *Raft) ticker() {
 				if term == rf.CurrentTerm {
 					log.Printf("--term: %v follower id: %v 收到心跳，重置选举超时--\n", rf.CurrentTerm, rf.me)
 					// 不重置投票
+					rf.permitLock <- 1
 				} else if term > rf.CurrentTerm {
 					log.Printf("--term: %v follower id: %v 收到心跳,成为follower,重置选举超时--\n", term, rf.me)
 					rf.toFollower(term)
+					rf.permitLock <- 1
 				}
 			case voteMsg := <-rf.voteSignal:
 				log.Printf("--term: %v follower id: %v 投票给candidate id: %v,重置选举超时--\n", rf.CurrentTerm, rf.me, voteMsg.CandidateId)
 				rf.VatedFor = voteMsg.CandidateId
 				rf.persist()
+				rf.permitLock <- 1
 			}
 		} else if rf.Role == LEADER {
 			select {
@@ -700,9 +707,11 @@ func (rf *Raft) ticker() {
 			case term := <-rf.heartbeatSignal:
 				log.Printf("--term: %v leader id: %v 收到有效AppendEntries消息,成为follower--", term, rf.me)
 				rf.toFollower(term)
+				rf.permitLock <- 1
 			case voteMsg := <-rf.voteSignal:
 				log.Printf("--term: %v leader id: %v 收到请求投票:candidate id: %v,成为follower--", voteMsg.Term, rf.me, voteMsg.CandidateId)
 				rf.toFollower(voteMsg.Term)
+				rf.permitLock <- 1
 			}
 		} else if rf.Role == CANDIDATE {
 			// 开始选举
@@ -723,10 +732,12 @@ func (rf *Raft) ticker() {
 					// 收到有效心跳，乖乖成为FOLLOWER
 					log.Printf("--term: %v candidate id: %v 收到有效AppendEntries消息,成为follower--", term, rf.me)
 					rf.toFollower(term)
+					rf.permitLock <- 1
 					break LOOP
 				case voteMsg := <-rf.voteSignal:
 					log.Printf("--term: %v candidate id: %v 收到请求投票: candidate id: %v,成为follower--", voteMsg.Term, rf.me, voteMsg.CandidateId)
 					rf.toFollower(voteMsg.Term)
+					rf.permitLock <- 1
 					break LOOP
 				case reply := <-ch:
 					if reply.Term > rf.CurrentTerm { // 已经产生了新的leader
@@ -815,6 +826,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applySignal = applyCh
 
 	rf.Quorum = len(rf.peers)/2 + 1
+
+	rf.permitLock = make(chan int, 1)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
